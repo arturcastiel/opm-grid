@@ -1251,12 +1251,19 @@ Dune::cpgrid::Intersection CpGrid::getParentIntersectionFromLgrBoundaryFace(cons
             // Get parent cell of the refined cell
             const auto& parentCell = refinedCell.father();
 
-            // Find the face of parentCell that touches coarseCell directly.
-            // Matching on indexInInside() is wrong: that index is in coarseCell, but
-            // the shared face has the opposite local orientation in parentCell
-            // (e.g. z+ in coarseCell is z- in parentCell), so we search by neighbor instead.
+            // The face index must be taken from the FINE cell, not the coarse cell.
+            // The fine cell inherits its face directions from its parent, so
+            // parentIntersection.indexInInside() matches intersection.indexInOutside()
+            // (the face index as seen from the fine/refined cell).
+            // Using indexInInside() (face index in the coarse cell) is wrong because
+            // the shared face has opposite local orientations in the two cells
+            // (e.g. z+ in coarseCell is z- in parentCell).
+            const auto intersectionIdxInRefined = (coarseCell == cellIn)
+                ? intersection.indexInOutside()  // fine cell is outside
+                : intersection.indexInInside();  // fine cell is inside
+
             for(const auto& parentIntersection : intersections(this->levelGridView(0), parentCell)){
-                if (parentIntersection.neighbor() && parentIntersection.outside() == coarseCell) {
+                if (parentIntersection.indexInInside() == intersectionIdxInRefined) {
                     return parentIntersection;
                 }
             }
