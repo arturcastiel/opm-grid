@@ -322,14 +322,19 @@ MinpvProcessor::process(const std::vector<double>& thickness,
                         option4ALLZero = option4ALLZero || (!permz.empty() && permz[c_above] == 0.0) || multz(c_above) == 0.0;
                         nnc_allowed = nnc_allowed && (computeGap(cz_above, cz_below) < max_gap) && (!pinchOption4ALL || !option4ALLZero) ;
 
+                        // With thin_cells_as_minpv a thin cell counts as low-pv here
+                        // too; with it off these reduce to the plain pv comparison.
+                        const bool above_holds_volume = (pv[c_above] > minpvv[c_above])
+                            && !(thin_cells_as_minpv && thickness[c_above] < z_tolerance);
+                        const bool below_holds_volume = (pv[c_below] > minpvv[c_below])
+                            && !(thin_cells_as_minpv && thickness[c_below] < z_tolerance);
+
                         // Note that collapsed cells become inactive in preprocess.c
                         // We treat them as a barrier preventing NNCs here.
                         if ( nnc_allowed &&
                              (actnum.empty() || (actnum[c_above] && actnum[c_below])) &&
                              !isCollapsed(cz_below) && !isCollapsed(cz_above) &&
-                             pv[c_above] > minpvv[c_above] && pv[c_below] > minpvv[c_below] &&
-                             !(thin_cells_as_minpv && (thickness[c_above] < z_tolerance ||
-                                                       thickness[c_below] < z_tolerance))) {
+                             above_holds_volume && below_holds_volume) {
                             result.add_nnc(c_above, c_below);
                         }
                         kk = kk_iter;
