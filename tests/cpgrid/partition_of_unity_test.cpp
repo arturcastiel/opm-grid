@@ -1,5 +1,5 @@
 /*
-  Copyright 2026 SINTEF Digital, Mathematics and Cybernetics.
+  Copyright 2026 Equinor ASA.
 
   This file is part of the Open Porous Media project (OPM).
 
@@ -35,7 +35,6 @@
 #include <map>
 #include <set>
 #include <vector>
-
 
 namespace
 {

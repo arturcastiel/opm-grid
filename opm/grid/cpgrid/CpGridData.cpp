@@ -204,12 +204,6 @@ PartitionType getPartitionType(const PartitionTypeIndicator& p, int i,
     return p.getPartitionType(Entity<3>(grid, i, true));
 }
 
-// Row entries of Opm::SparseTable<int> are visited through this iterator type.
-int getIndex(std::vector<int>::const_iterator i)
-{
-    return *i;
-}
-
 int getIndex(const int* i)
 {
     return *i;
@@ -937,8 +931,7 @@ struct AttributeDataHandle
 
     bool fixedSize()
     {
-        // SparseTable rows have varying length (all points of a cell).
-        return false;
+        return true;
     }
     std::size_t size(std::size_t i)
     {
@@ -947,7 +940,8 @@ struct AttributeDataHandle
     template<class B>
     void gather(B& buffer, std::size_t i)
     {
-        for(auto f=c2e_[i].begin(), fend=c2e_[i].end();
+        typedef typename GetRowType<T>::type::const_iterator RowIter;
+        for(RowIter f=c2e_[i].begin(), fend=c2e_[i].end();
             f!=fend; ++f)
         {
             char t=getPartitionType(indicator_, *f, grid_);
@@ -958,7 +952,8 @@ struct AttributeDataHandle
     template<class B>
     void scatter(B& buffer, std::size_t i, std::size_t s)
     {
-        for(auto f=c2e_[i].begin(), fend=c2e_[i].end();
+        typedef typename GetRowType<T>::type::const_iterator RowIter;
+        for(RowIter f=c2e_[i].begin(), fend=c2e_[i].end();
             f!=fend; ++f, --s)
         {
             std::pair<int,char> rank_attr;
@@ -972,6 +967,68 @@ struct AttributeDataHandle
     const T& c2e_;
     const CpGridData& grid_;
 };
+
+// Partition types of every point of a cell, walked face by face on the fly, so no
+// cell-to-point table is built.  The order matches on all ranks sharing the cell.
+struct CellPointAttributeDataHandle
+{
+    using DataType = std::pair<int,char>;
+
+    CellPointAttributeDataHandle(int rank, const PartitionTypeIndicator& indicator,
+                                 std::vector<std::map<int, char> >& vals,
+                                 const OrientedEntityTable<0, 1>& cell_to_face,
+                                 const Opm::SparseTable<int>& face_to_point,
+                                 const CpGridData& grid)
+        : rank_(rank), indicator_(indicator), vals_(vals),
+          c2f_(cell_to_face), f2p_(face_to_point), grid_(grid)
+    {}
+
+    bool fixedSize()
+    {
+        return false;
+    }
+    std::size_t size(std::size_t i)
+    {
+        std::size_t n = 0;
+        forEachPoint(i, [&n](int) { ++n; });
+        return n;
+    }
+    template<class B>
+    void gather(B& buffer, std::size_t i)
+    {
+        forEachPoint(i, [&](int p)
+        { buffer.write(std::make_pair(rank_, char(getPartitionType(indicator_, p, grid_)))); });
+    }
+    template<class B>
+    void scatter(B& buffer, std::size_t i, std::size_t)
+    {
+        forEachPoint(i, [&](int p)
+        {
+            DataType rank_attr;
+            buffer.read(rank_attr);
+            vals_[p].insert(rank_attr);
+        });
+    }
+
+private:
+    template<class F>
+    void forEachPoint(std::size_t i, F&& f) const
+    {
+        for (const auto& face : c2f_[EntityRep<0>(i, true)]) {
+            for (const int p : f2p_[face.index()]) {
+                f(p);
+            }
+        }
+    }
+
+    int rank_;
+    const PartitionTypeIndicator& indicator_;
+    std::vector<std::map<int, char> >& vals_;
+    const OrientedEntityTable<0, 1>& c2f_;
+    const Opm::SparseTable<int>& f2p_;
+    const CpGridData& grid_;
+};
+
 
 template<class T, class Functor, class FromSet, class ToSet>
 struct InterfaceFunctor
@@ -1715,40 +1772,12 @@ void CpGridData::computeCommunicationInterfaces([[maybe_unused]] int noExistingP
     face_interfaces_);
     std::vector<std::map<int,char> >().swap(face_attributes);
     */
-    // Build the point (codim 3) communication interface from ALL points of
-    // each cell -- every node of every face -- not only the eight canonical
-    // corners stored in cell_to_point_.  On corner-point grids with hanging
-    // nodes a face can reference nodes that are not canonical corners of the
-    // neighbouring cell; interfaces built from the canonical corners only
-    // miss those nodes, leaving them without communication (node ownership
-    // then fails to be a partition of unity).
-    // The gather/scatter of AttributeDataHandle pairs entries of the
-    // sender's and the receiver's row for the same cell BY POSITION, so the
-    // rows must list the points in an order that is identical on every rank
-    // sharing the cell.  Local point indices differ between ranks; the
-    // face/point traversal order is copied from the global grid during
-    // distribution and is rank-independent.  Deduplicate while preserving
-    // the first-occurrence traversal order -- do NOT sort by local index.
-    const std::size_t nc = cell_to_point_.size();
-    std::vector<int> points;
-    for (std::size_t cell = 0; cell < nc; ++cell) {
-        points.clear();
-        const auto& faces = cell_to_face_[cpgrid::EntityRep<0>(cell, true)];
-        const int nf = faces.size();
-        for (int f = 0; f < nf; ++f) {
-            for (const auto& fv : face_to_point_[faces[f].index()]) {
-                if (std::find(points.begin(), points.end(), fv) == points.end()) {
-                    points.push_back(fv);
-                }
-            }
-        }
-        cell_to_allpoint_.appendRow(points.begin(), points.end());
-    }
-
+    // All points of each cell, not only its eight corners: with hanging nodes a face
+    // can hold points that are no corner of the neighbouring cell.
     std::vector<std::map<int,char> > point_attributes(noExistingPoints);
-    AttributeDataHandle<Opm::SparseTable<int> >
+    CellPointAttributeDataHandle
         point_handle(ccobj_.rank(), *partition_type_indicator_,
-                     point_attributes, cell_to_allpoint_, *this);
+                     point_attributes, cell_to_face_, face_to_point_, *this);
     if( static_cast<const Dune::Interface&>(std::get<All_All_Interface>(cell_interfaces_))
         .interfaces().size() )
     {
