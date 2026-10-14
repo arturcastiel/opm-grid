@@ -1453,7 +1453,8 @@ BOOST_AUTO_TEST_CASE(skewPillarCompatibleSubdivisionMosaic)
 }
 
 // Stacked boxes sharing a k-face on inclined pillars: the shared corners
-// collapse in the vertical fraction onto the tilted layer surface.
+// collapse in the vertical fraction onto the tilted layer surface. They take
+// the column's pillars; each box's own layer would give them different ones.
 BOOST_AUTO_TEST_CASE(skewPillarStackedBoxesShareKFace)
 {
     auto parent = makeSkewPillarGrid({2, 2, 4}, tiltedDepth);
@@ -1465,10 +1466,15 @@ BOOST_AUTO_TEST_CASE(skewPillarStackedBoxesShareKFace)
     useConformingBuilder(grid, std::make_unique<Opm::Refinement::ConformingBlockBuilder>(
         parent.dims, parent.coord, parent.zcorn, parent.actnum));
 
-    grid.addLgrsUpdateLeafView({{2,2,2}, {2,2,3}},
-                               {{0,0,0}, {0,0,2}},
-                               {{2,2,2}, {2,2,4}},
-                               {"LOW", "HIGH"});
+    auto requests = Opm::Refinement::blockRefinements({{2,2,2}, {2,2,3}},
+                                                      {{0,0,0}, {0,0,2}},
+                                                      {{2,2,2}, {2,2,4}},
+                                                      {"LOW", "HIGH"},
+                                                      {});
+    for (auto& request : requests) {
+        request.pillarsFromBoxLayer = false;
+    }
+    grid.addLgrsUpdateLeafView(requests);
 
     BOOST_REQUIRE_EQUAL(grid.maxLevel(), 2);
     BOOST_CHECK_EQUAL(grid.size(0), 8*8 + 8*12);
@@ -1480,8 +1486,9 @@ BOOST_AUTO_TEST_CASE(skewPillarStackedBoxesShareKFace)
     BOOST_CHECK_GT(minVertexPairDistance(grid), 1e-3);
 }
 
-// Boxes stacked in a column get bitwise the same refined pillars; with
-// pillarsFromBoxLayer (the reference) only a box starting at the column top does.
+// Boxes stacked in a column get bitwise the same refined pillars from the
+// column; from the box's own layer, the default, only a box starting at the
+// column top does.
 BOOST_AUTO_TEST_CASE(skewPillarRefinedPillarsFromColumn)
 {
     const auto parent = makeSkewPillarGrid({2, 2, 4}, tiltedDepth);
@@ -1496,6 +1503,8 @@ BOOST_AUTO_TEST_CASE(skewPillarRefinedPillarsFromColumn)
                                             parent.zcorn.data(), parent.actnum.data(),
                                             req).coord;
     };
+    BOOST_CHECK(Opm::Refinement::BlockRefinement{}.pillarsFromBoxLayer);
     BOOST_CHECK(coordOf(0, 2, false) == coordOf(2, 4, false));
     BOOST_CHECK(coordOf(0, 2, true) == coordOf(0, 2, false));
+    BOOST_CHECK(coordOf(2, 4, true) != coordOf(2, 4, false));
 }

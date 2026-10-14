@@ -127,18 +127,38 @@ BOOST_AUTO_TEST_CASE(trilinearRefusesConformingOnlyRequests)
 {
     auto graded = box("LGR1", {1,1,1}, {2,2,2});
     graded.subdivision[0] = { {0, 0, 0}, {0.0, 0.2, 0.5}, {0.2, 0.5, 1.0} };
-    auto pillars = box("LGR1", {1,1,1}, {2,2,2});
-    pillars.pillarsFromBoxLayer = true;
     auto minpv = box("LGR1", {1,1,1}, {2,2,2});
     minpv.minpvRemoved.assign(8, 0);
 
-    for (const auto& request : { graded, pillars, minpv }) {
+    for (const auto& request : { graded, minpv }) {
         Dune::CpGrid grid;
         makeGrid(grid);
         BOOST_CHECK_THROW(grid.addLgrsUpdateLeafView(std::vector<BlockRefinement>{ request }),
                           std::invalid_argument);
         BOOST_CHECK_EQUAL(grid.maxLevel(), 0);
     }
+}
+
+// Pillars from the box's own layer are the default, and the Trilinear
+// backend refines either pillar mode the same way: it builds every refined
+// cell from its host's corners.
+BOOST_AUTO_TEST_CASE(trilinearRefinesEitherPillarMode)
+{
+    const auto fromBox = box("LGR1", {1,1,1}, {3,2,2});
+    BOOST_CHECK(fromBox.pillarsFromBoxLayer);
+    auto fromColumn = fromBox;
+    fromColumn.pillarsFromBoxLayer = false;
+
+    Dune::CpGrid byBox;
+    Dune::CpGrid byColumn;
+    makeGrid(byBox);
+    makeGrid(byColumn);
+    byBox.addLgrsUpdateLeafView(std::vector<BlockRefinement>{ fromBox });
+    byColumn.addLgrsUpdateLeafView(std::vector<BlockRefinement>{ fromColumn });
+
+    BOOST_CHECK_EQUAL(byBox.maxLevel(), 1);
+    BOOST_CHECK_EQUAL(byBox.size(0), byColumn.size(0));
+    BOOST_CHECK_EQUAL(byBox.size(3), byColumn.size(3));
 }
 
 // The two backends never meet on one grid.
