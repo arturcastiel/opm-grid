@@ -69,6 +69,8 @@ namespace Refinement
 /// @param outRefined   If non-null, receives the resampled refined corner-point
 ///                     description of this level (its own children, if any, are
 ///                     refined from it).
+/// @param pinchActive  Level zero's PINCH state, so the level grid joins cells
+///                     across removed children exactly when level zero would.
 std::shared_ptr<Dune::cpgrid::CpGridData>
 assembleBlockLevelGrid(const Dune::cpgrid::CpGridData& parentGrid,
                        const std::array<int,3>& parentDims,
@@ -80,7 +82,8 @@ assembleBlockLevelGrid(const Dune::cpgrid::CpGridData& parentGrid,
                        int parentLevel,
                        std::vector<std::shared_ptr<Dune::cpgrid::CpGridData>>& levelStorage,
                        Dune::MPIHelper::MPICommunicator comm,
-                       RefinedBlockGrdecl* outRefined = nullptr);
+                       RefinedBlockGrdecl* outRefined = nullptr,
+                       bool pinchActive = false);
 
 /// An empty (zero-cell) refined level grid for a box that has no cells on
 /// this rank (distributed runs, rank-interior LGRs). All ranks must carry
