@@ -1342,6 +1342,41 @@ BOOST_AUTO_TEST_CASE(boxesMeetingOnlyAcrossThrowMustNest)
                       std::invalid_argument);
 }
 
+// The leaf assembly refuses after the level grids are built; the grid must be left
+// unrefined and accept a valid request afterwards.
+BOOST_AUTO_TEST_CASE(failedRefinementLeavesGridUnchanged)
+{
+    auto depth = [](int i_, int j_, int k_) {
+        (void)j_;
+        const double base = 2.0*(cellOf(k_) + sideOf(k_));
+        return (cellOf(i_) >= 2) ? base + 5.0 : base;
+    };
+    auto parent = makeVerticalPillarGrid({4, 2, 8}, depth);
+
+    Dune::CpGrid grid;
+    auto rawParent = parent.raw();
+    grid.processEclipseFormat(rawParent, false);
+    const int cellsBefore = grid.leafGridView().size(0);
+    const double volumeBefore = totalVolume(grid);
+
+    useConformingBuilder(grid, std::make_unique<Opm::Refinement::ConformingBlockBuilder>(
+        parent.dims, parent.coord, parent.zcorn, parent.actnum));
+
+    BOOST_CHECK_THROW(grid.addLgrsUpdateLeafView({{2,3,2}, {2,2,3}},
+                                                 {{0,0,6}, {2,0,3}},
+                                                 {{2,2,8}, {4,2,5}},
+                                                 {"A", "B"}),
+                      std::invalid_argument);
+    BOOST_CHECK_EQUAL(grid.currentData().size(), 1u);
+    BOOST_CHECK_EQUAL(grid.maxLevel(), 0);
+    BOOST_CHECK_EQUAL(grid.leafGridView().size(0), cellsBefore);
+    BOOST_CHECK(grid.currentData().front()->getParentToChildren().empty());
+
+    grid.addLgrsUpdateLeafView({{2,3,2}}, {{0,0,6}}, {{2,2,8}}, {"A"});
+    BOOST_CHECK_EQUAL(grid.maxLevel(), 1);
+    BOOST_CHECK_CLOSE(totalVolume(grid), volumeBefore, 1e-8);
+}
+
 BOOST_AUTO_TEST_CASE(faultNotOnBoxBoundaryBuilds)
 {
     // Control: a fault exists (between i=0 and i=1) but the box (i=2..3) sits

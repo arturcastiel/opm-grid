@@ -35,9 +35,12 @@
 #include <dune/common/parallel/mpihelper.hh>
 
 #include <array>
+#include <exception>
 #include <map>
+#include <memory>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -282,6 +285,22 @@ void ConformingBlockBuilder::build(Dune::CpGrid& grid,
     }
 
     auto& storage = grid.currentData();
+    // A throw from here on must leave the grid as it was: drop the new levels and leaf.
+    struct RestoreOnThrow
+    {
+        std::vector<std::shared_ptr<Dune::cpgrid::CpGridData>>& storage;
+        std::size_t size = storage.size();
+        std::vector<std::tuple<int, std::vector<int>>> parentToChildren0
+            = storage.front()->getParentToChildren();
+        int pending = std::uncaught_exceptions();
+        ~RestoreOnThrow()
+        {
+            if (std::uncaught_exceptions() > pending) {
+                storage.resize(size);
+                GridStateWriter::setParentToChildren(*storage.front(), std::move(parentToChildren0));
+            }
+        }
+    } restoreOnThrow{storage};
     // The refinement is "distributed" (rank-interior: only the owning rank
     // refines each box) only once the grid has actually been scattered. Before
     // load balancing - the refine-before-redistribute path - the grid is still
