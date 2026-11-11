@@ -1653,6 +1653,61 @@ assembleLeafGridImpl(std::vector<std::shared_ptr<CpGridData>>& storage,
         }
     }
 
+    // ----- Drop unused corners -------------------------------------------------
+    // Level-zero vertices that lie only on replaced faces or cells; a vertex-based
+    // discretization cannot have them.
+    {
+        std::vector<int> newIndex(numLeafCorners, -1);
+        for (int face = 0; face < leafFaceToPoint.size(); ++face) {
+            for (const int p : leafFaceToPoint[face]) {
+                newIndex[p] = 0;
+            }
+        }
+        for (const auto& points : leafCellToPoint) {
+            for (const int p : points) {
+                newIndex[p] = 0;
+            }
+        }
+        int numKept = 0;
+        for (auto& n : newIndex) {
+            if (n == 0) {
+                n = numKept++;
+            }
+        }
+        if (numKept < numLeafCorners) {
+            const int firstSplit = static_cast<int>(leafCornerHistory.size());
+            std::vector<Dune::cpgrid::Geometry<0,3>> keptCorners;
+            std::vector<std::array<int,2>> keptHistory;
+            std::vector<std::array<int,2>> keptSplitKeys;
+            keptCorners.reserve(numKept);
+            for (int c = 0; c < numLeafCorners; ++c) {
+                if (newIndex[c] < 0) {
+                    continue;
+                }
+                keptCorners.push_back(leafCorners[c]);
+                if (c < firstSplit) {
+                    keptHistory.push_back(leafCornerHistory[c]);
+                } else {
+                    keptSplitKeys.push_back(splitKeys[c - firstSplit]);
+                }
+            }
+            leafCorners.assign(keptCorners.begin(), keptCorners.end());
+            leafCornerHistory = std::move(keptHistory);
+            splitKeys = std::move(keptSplitKeys);
+            for (int face = 0; face < leafFaceToPoint.size(); ++face) {
+                for (auto& p : leafFaceToPoint[face]) {
+                    p = newIndex[p];
+                }
+            }
+            for (auto& points : leafCellToPoint) {
+                for (auto& p : points) {
+                    p = newIndex[p];
+                }
+            }
+            numLeafCorners = numKept;
+        }
+    }
+
     // Cell geometries: centers/volumes from the source grids, corner list
     // pointing into the leaf pool via the leaf's cell_to_point_.
     Dune::cpgrid::EntityVariableBase<Dune::cpgrid::Geometry<3,3>>& leafCellGeom =
