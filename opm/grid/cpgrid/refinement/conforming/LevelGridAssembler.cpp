@@ -127,7 +127,8 @@ assembleBlockLevelGrid(const Dune::cpgrid::CpGridData& parentGrid,
                        int parentLevel,
                        std::vector<std::shared_ptr<Dune::cpgrid::CpGridData>>& levelStorage,
                        Dune::MPIHelper::MPICommunicator comm,
-                       RefinedBlockGrdecl* outRefined)
+                       RefinedBlockGrdecl* outRefined,
+                       bool pinchActive)
 {
     // Stages 2+3: resample the block geometry onto sub-pillars.
     const RefinedBlockGrdecl refined = refineBlock(parentDims, coord, zcorn, actnum, request);
@@ -157,7 +158,7 @@ assembleBlockLevelGrid(const Dune::cpgrid::CpGridData& parentGrid,
                                 nnc,
                                 /* remove_ij_boundary = */ false,
                                 /* turn_normals = */ false,
-                                /* pinchActive = */ !nnc[0].empty(),
+                                pinchActive,
                                 /* tolerance_unique_points = */ 0.0,
                                 /* edge_conformal = */ false);
 

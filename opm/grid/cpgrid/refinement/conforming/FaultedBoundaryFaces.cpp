@@ -126,9 +126,9 @@ faultedBoundaryConnections(const std::array<int,3>& parentDims,
     raw.zcorn = refined.zcorn.data();
     raw.actnum = refined.actnum.empty() ? nullptr : refined.actnum.data();
 
-    // No merging tolerance, as for the box's level grid: equal depths stay equal points.
+    // Merge depths equal up to rounding: a throw on a sub-layer boundary otherwise leaves sliver faces.
     struct processed_grid out;
-    if (!process_grdecl(/*pinchActive=*/1, edgeConformal ? 1 : 0, 0.0, &raw, nullptr, &out)) {
+    if (!process_grdecl(/*pinchActive=*/1, edgeConformal ? 1 : 0, 1e-6, &raw, nullptr, &out)) {
         OPM_THROW(std::runtime_error, "Processing the faulted side of refinement '" + box.name
                   + "' as a corner-point grid failed.");
     }

@@ -33,6 +33,8 @@
 #include <opm/common/ErrorMacros.hpp>
 
 #include <algorithm>
+#include <cmath>
+#include <cstdint>
 #include <cstdlib>
 #include <functional>
 #include <map>
@@ -54,6 +56,57 @@ using Dune::cpgrid::CpGridData;
 using Dune::cpgrid::EntityRep;
 using Opm::Refinement::BlockRefinement;
 using Opm::Refinement::GridStateWriter;
+
+// Corners closer than this (m) are one vertex. Equal to the tolerance the
+// faulted-side helper grid merges its points with.
+constexpr double cornerMergeTolerance = 1e-6;
+
+// Nearest registered point within cornerMergeTolerance. Buckets are one
+// tolerance wide, so the 27 around a point hold every candidate.
+class CornerLocator
+{
+public:
+    void add(const std::array<double,3>& p, int index)
+    {
+        buckets_[bucketOf(p)].emplace_back(p, index);
+    }
+
+    int find(const std::array<double,3>& p) const
+    {
+        const auto b = bucketOf(p);
+        int best = -1;
+        double bestDist2 = cornerMergeTolerance*cornerMergeTolerance;
+        for (std::int64_t di = -1; di <= 1; ++di) {
+            for (std::int64_t dj = -1; dj <= 1; ++dj) {
+                for (std::int64_t dk = -1; dk <= 1; ++dk) {
+                    const auto it = buckets_.find({b[0] + di, b[1] + dj, b[2] + dk});
+                    if (it == buckets_.end()) {
+                        continue;
+                    }
+                    for (const auto& [q, index] : it->second) {
+                        const double d2 = (q[0]-p[0])*(q[0]-p[0]) + (q[1]-p[1])*(q[1]-p[1])
+                                        + (q[2]-p[2])*(q[2]-p[2]);
+                        if (d2 <= bestDist2 && (best < 0 || d2 < bestDist2 || index < best)) {
+                            best = index;
+                            bestDist2 = d2;
+                        }
+                    }
+                }
+            }
+        }
+        return best;
+    }
+
+private:
+    using Bucket = std::array<std::int64_t,3>;
+    static Bucket bucketOf(const std::array<double,3>& p)
+    {
+        return { static_cast<std::int64_t>(std::floor(p[0]/cornerMergeTolerance)),
+                 static_cast<std::int64_t>(std::floor(p[1]/cornerMergeTolerance)),
+                 static_cast<std::int64_t>(std::floor(p[2]/cornerMergeTolerance)) };
+    }
+    std::map<Bucket, std::vector<std::pair<std::array<double,3>, int>>> buckets_;
+};
 
 // Numerical aquifer cells are never refined (refused in a box): each is a
 // level-zero cell of the leaf.
@@ -304,14 +357,19 @@ namespace Opm
 namespace Refinement
 {
 
+namespace
+{
+
+// collective: this rank has reached the cross-rank agreement in the leaf assembly.
 std::shared_ptr<CpGridData>
-assembleLeafGrid(std::vector<std::shared_ptr<CpGridData>>& storage,
-                 const std::vector<BlockRefinement>& requests,
-                 const std::array<int,3>& parentDims,
-                 const double* coord,
-                 const double* zcorn,
-                 const int* actnum,
-                 Dune::MPIHelper::MPICommunicator comm)
+assembleLeafGridImpl(std::vector<std::shared_ptr<CpGridData>>& storage,
+                     const std::vector<BlockRefinement>& requests,
+                     const std::array<int,3>& parentDims,
+                     const double* coord,
+                     const double* zcorn,
+                     const int* actnum,
+                     Dune::MPIHelper::MPICommunicator comm,
+                     bool& collective)
 {
     CpGridData& level0 = *storage[0];
     const int numBoxes = static_cast<int>(requests.size());
@@ -514,18 +572,16 @@ assembleLeafGrid(std::vector<std::shared_ptr<CpGridData>>& storage,
         leafCornerHistory[corner] = {0, corner};
     }
 
-    // Refined corners shared between touching boxes (edge/corner-sharing)
-    // coincide bitwise: both boxes resample the same parent description with
-    // equal subdivisions, so the arithmetic is identical. Exact-coordinate
-    // matching is therefore correct (not a fragile floating-point heuristic)
-    // and merges those corners into one pool entry. Disjoint boxes only
-    // coincide on shared boundaries, so a global map over refined corners is
-    // safe.
-    std::map<std::array<double,3>, int> refinedCornerPool;
+    // A refined corner that is not a parent corner may still coincide with a
+    // level-zero corner (across a fault) or with another box's refined corner.
     const auto coordKey = [](const Dune::cpgrid::Geometry<0,3>& corner) {
         const auto& c = corner.center();
         return std::array<double,3>{ c[0], c[1], c[2] };
     };
+    CornerLocator cornerLocator;
+    for (int corner = 0; corner < numCorners0; ++corner) {
+        cornerLocator.add(coordKey(corners0[corner]), corner);
+    }
 
     for (int b = 0; b < numBoxes; ++b) {
         BoxData& box = boxes[b];
@@ -545,19 +601,18 @@ assembleLeafGrid(std::vector<std::shared_ptr<CpGridData>>& storage,
             }
             else {
                 const auto key = coordKey(cornersL[corner]);
-                const auto existing = refinedCornerPool.find(key);
-                if (existing != refinedCornerPool.end()) {
-                    // Shared with an already-processed box: reuse, and keep
-                    // the corner's birth identity from that earlier box.
-                    box.cornerToLeaf[corner] = existing->second;
-                    levelCornerHistory[corner] = leafCornerHistory[existing->second];
+                const int existing = cornerLocator.find(key);
+                if (existing >= 0) {
+                    // Keep the birth identity of the corner it coincides with.
+                    box.cornerToLeaf[corner] = existing;
+                    levelCornerHistory[corner] = leafCornerHistory[existing];
                 }
                 else {
                     const int leafCorner = static_cast<int>(leafCorners.size());
                     box.cornerToLeaf[corner] = leafCorner;
                     leafCorners.push_back(cornersL[corner]);
                     leafCornerHistory.push_back({b + 1, corner});
-                    refinedCornerPool.emplace(key, leafCorner);
+                    cornerLocator.add(key, leafCorner);
                 }
             }
         }
@@ -1160,24 +1215,16 @@ assembleLeafGrid(std::vector<std::shared_ptr<CpGridData>>& storage,
     std::vector<SyntheticFace> syntheticFaces;
     std::vector<std::array<int,2>> splitKeys;    // {box, ordinal} per leaf corner past the history
     if (!faultedSides.empty() || !interiorFaults.empty()) {
-        // coord -> leaf corner index, over the current pool (exact match: the
-        // box-boundary corners are produced by identical resampling arithmetic).
-        std::map<std::array<double,3>, int> cornerByCoord;
-        for (int c = 0; c < static_cast<int>(leafCorners.size()); ++c) {
-            cornerByCoord[coordKey(leafCorners[c])] = c;
-        }
-
-        // Map a coordinate to a leaf-pool corner (dedup; append if new).
+        // Map a coordinate to a leaf-pool corner (merge within tolerance; append if new).
         const auto poolCorner = [&](const std::array<double,3>& nd) {
-            const std::array<double,3> key3{ nd[0], nd[1], nd[2] };
-            auto pit = cornerByCoord.find(key3);
-            if (pit != cornerByCoord.end()) {
-                return pit->second;
+            const int found = cornerLocator.find(nd);
+            if (found >= 0) {
+                return found;
             }
             const int idx = static_cast<int>(leafCorners.size());
             leafCorners.push_back(Dune::cpgrid::Geometry<0,3>(
                 Dune::FieldVector<double,3>{ nd[0], nd[1], nd[2] }));
-            cornerByCoord.emplace(key3, idx);
+            cornerLocator.add(nd, idx);
             return idx;
         };
         // The pieces of a box cell's side toward one neighbour: a coarse cell, the
@@ -1194,14 +1241,23 @@ assembleLeafGrid(std::vector<std::shared_ptr<CpGridData>>& storage,
         const auto addPiece = [&](int b, int boxCellLevel, int boxLeaf, int neighborLeaf,
                                   int axis, int side,
                                   const std::vector<std::array<double,3>>& nodes) {
-            auto& group = faceGroups[std::make_tuple(boxLeaf, neighborLeaf, axis, side)];
-            group.box = b;
-            group.boxCellLevel = boxCellLevel;
             std::vector<int> pts;
             pts.reserve(nodes.size());
             for (const auto& nd : nodes) {
-                pts.push_back(poolCorner(nd));
+                const int p = poolCorner(nd);
+                if (pts.empty() || pts.back() != p) {
+                    pts.push_back(p);
+                }
             }
+            while (pts.size() > 1 && pts.front() == pts.back()) {
+                pts.pop_back();
+            }
+            if (pts.size() < 3) {
+                return;
+            }
+            auto& group = faceGroups[std::make_tuple(boxLeaf, neighborLeaf, axis, side)];
+            group.box = b;
+            group.boxCellLevel = boxCellLevel;
             group.pieces.push_back(std::move(pts));
         };
 
@@ -1648,6 +1704,61 @@ assembleLeafGrid(std::vector<std::shared_ptr<CpGridData>>& storage,
         }
     }
 
+    // ----- Drop unused corners -------------------------------------------------
+    // Level-zero vertices that lie only on replaced faces or cells; a vertex-based
+    // discretization cannot have them.
+    {
+        std::vector<int> newIndex(numLeafCorners, -1);
+        for (int face = 0; face < leafFaceToPoint.size(); ++face) {
+            for (const int p : leafFaceToPoint[face]) {
+                newIndex[p] = 0;
+            }
+        }
+        for (const auto& points : leafCellToPoint) {
+            for (const int p : points) {
+                newIndex[p] = 0;
+            }
+        }
+        int numKept = 0;
+        for (auto& n : newIndex) {
+            if (n == 0) {
+                n = numKept++;
+            }
+        }
+        if (numKept < numLeafCorners) {
+            const int firstSplit = static_cast<int>(leafCornerHistory.size());
+            std::vector<Dune::cpgrid::Geometry<0,3>> keptCorners;
+            std::vector<std::array<int,2>> keptHistory;
+            std::vector<std::array<int,2>> keptSplitKeys;
+            keptCorners.reserve(numKept);
+            for (int c = 0; c < numLeafCorners; ++c) {
+                if (newIndex[c] < 0) {
+                    continue;
+                }
+                keptCorners.push_back(leafCorners[c]);
+                if (c < firstSplit) {
+                    keptHistory.push_back(leafCornerHistory[c]);
+                } else {
+                    keptSplitKeys.push_back(splitKeys[c - firstSplit]);
+                }
+            }
+            leafCorners.assign(keptCorners.begin(), keptCorners.end());
+            leafCornerHistory = std::move(keptHistory);
+            splitKeys = std::move(keptSplitKeys);
+            for (int face = 0; face < leafFaceToPoint.size(); ++face) {
+                for (auto& p : leafFaceToPoint[face]) {
+                    p = newIndex[p];
+                }
+            }
+            for (auto& points : leafCellToPoint) {
+                for (auto& p : points) {
+                    p = newIndex[p];
+                }
+            }
+            numLeafCorners = numKept;
+        }
+    }
+
     // Cell geometries: centers/volumes from the source grids, corner list
     // pointing into the leaf pool via the leaf's cell_to_point_.
     Dune::cpgrid::EntityVariableBase<Dune::cpgrid::Geometry<3,3>>& leafCellGeom =
@@ -1673,6 +1784,12 @@ assembleLeafGrid(std::vector<std::shared_ptr<CpGridData>>& storage,
     // Coarse leaf cells inherit their level-zero global index and attribute;
     // refined cells are rank-interior (owner only) and get assignRefinedIds' ids,
     // which are above every coarse global id.
+    // Agree before the first collective; a rank that failed earlier joins from the wrapper.
+    collective = true;
+    if (Dune::Communication<Dune::MPIHelper::MPICommunicator>(comm).max(0) != 0) {
+        OPM_THROW(std::runtime_error, "LGR leaf assembly aborted because another rank failed"
+                  " (see that rank's message).");
+    }
     const auto ids = assignRefinedIds(storage, numBoxes, leafToLevel, leafCornerHistory,
                                       splitKeys, comm);
 #if HAVE_MPI
@@ -1743,6 +1860,29 @@ assembleLeafGrid(std::vector<std::shared_ptr<CpGridData>>& storage,
     }
 
     return leaf;
+}
+
+} // anonymous namespace
+
+std::shared_ptr<CpGridData>
+assembleLeafGrid(std::vector<std::shared_ptr<CpGridData>>& storage,
+                 const std::vector<BlockRefinement>& requests,
+                 const std::array<int,3>& parentDims,
+                 const double* coord,
+                 const double* zcorn,
+                 const int* actnum,
+                 Dune::MPIHelper::MPICommunicator comm)
+{
+    bool collective = false;
+    try {
+        return assembleLeafGridImpl(storage, requests, parentDims, coord, zcorn, actnum,
+                                    comm, collective);
+    } catch (...) {
+        if (!collective) {
+            Dune::Communication<Dune::MPIHelper::MPICommunicator>(comm).max(1);
+        }
+        throw;
+    }
 }
 
 } // namespace Refinement

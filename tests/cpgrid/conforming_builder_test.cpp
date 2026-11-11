@@ -1197,6 +1197,29 @@ BOOST_AUTO_TEST_CASE(faultLargeThrowAtBoxBoundaryBuilds)
     checkValidFaultedLeaf(grid, volumeBefore);
 }
 
+// A throw of half a layer puts the thrown depths on the box's sub-layer boundary, equal
+// only up to rounding (feet converted to metres, dipping layers).
+BOOST_AUTO_TEST_CASE(faultThrowOnSubLayerBoundaryBuilds)
+{
+    auto depth = [](int i_, int, int k_) {
+        const double ft = 0.3048;
+        const double z = ft*(8325.0 + 6.0*(cellOf(i_) + sideOf(i_)) + 20.0*(cellOf(k_) + sideOf(k_)));
+        return (cellOf(i_) >= 2) ? z + 10.0*ft : z;
+    };
+    auto parent = makeVerticalPillarGrid({4, 2, 4}, depth);
+
+    Dune::CpGrid grid;
+    auto rawParent = parent.raw();
+    grid.processEclipseFormat(rawParent, false);
+    const double volumeBefore = totalVolume(grid);
+
+    useConformingBuilder(grid, std::make_unique<Opm::Refinement::ConformingBlockBuilder>(
+        parent.dims, parent.coord, parent.zcorn, parent.actnum));
+
+    BOOST_REQUIRE_NO_THROW(grid.addLgrsUpdateLeafView({{3,3,2}}, {{0,0,1}}, {{2,2,3}}, {"LGR1"}));
+    checkValidFaultedLeaf(grid, volumeBefore);
+}
+
 namespace
 {
 
@@ -1319,6 +1342,41 @@ BOOST_AUTO_TEST_CASE(boxesMeetingOnlyAcrossThrowMustNest)
                       std::invalid_argument);
 }
 
+// The leaf assembly refuses after the level grids are built; the grid must be left
+// unrefined and accept a valid request afterwards.
+BOOST_AUTO_TEST_CASE(failedRefinementLeavesGridUnchanged)
+{
+    auto depth = [](int i_, int j_, int k_) {
+        (void)j_;
+        const double base = 2.0*(cellOf(k_) + sideOf(k_));
+        return (cellOf(i_) >= 2) ? base + 5.0 : base;
+    };
+    auto parent = makeVerticalPillarGrid({4, 2, 8}, depth);
+
+    Dune::CpGrid grid;
+    auto rawParent = parent.raw();
+    grid.processEclipseFormat(rawParent, false);
+    const int cellsBefore = grid.leafGridView().size(0);
+    const double volumeBefore = totalVolume(grid);
+
+    useConformingBuilder(grid, std::make_unique<Opm::Refinement::ConformingBlockBuilder>(
+        parent.dims, parent.coord, parent.zcorn, parent.actnum));
+
+    BOOST_CHECK_THROW(grid.addLgrsUpdateLeafView({{2,3,2}, {2,2,3}},
+                                                 {{0,0,6}, {2,0,3}},
+                                                 {{2,2,8}, {4,2,5}},
+                                                 {"A", "B"}),
+                      std::invalid_argument);
+    BOOST_CHECK_EQUAL(grid.currentData().size(), 1u);
+    BOOST_CHECK_EQUAL(grid.maxLevel(), 0);
+    BOOST_CHECK_EQUAL(grid.leafGridView().size(0), cellsBefore);
+    BOOST_CHECK(grid.currentData().front()->getParentToChildren().empty());
+
+    grid.addLgrsUpdateLeafView({{2,3,2}}, {{0,0,6}}, {{2,2,8}}, {"A"});
+    BOOST_CHECK_EQUAL(grid.maxLevel(), 1);
+    BOOST_CHECK_CLOSE(totalVolume(grid), volumeBefore, 1e-8);
+}
+
 BOOST_AUTO_TEST_CASE(faultNotOnBoxBoundaryBuilds)
 {
     // Control: a fault exists (between i=0 and i=1) but the box (i=2..3) sits
@@ -1344,6 +1402,114 @@ BOOST_AUTO_TEST_CASE(faultNotOnBoxBoundaryBuilds)
     BOOST_CHECK_NO_THROW(grid.addLgrsUpdateLeafView({{2,2,2}}, {{2,0,0}}, {{4,2,2}}, {"LGR1"}));
     BOOST_CHECK_EQUAL(grid.maxLevel(), 1);
     BOOST_CHECK_CLOSE(totalVolume(grid), volumeBefore, 1e-8);
+}
+
+namespace
+{
+// Vertices of the leaf (level -1) or a level that are no cell's corner and, unless
+// cornersOnly, in no face either.
+int unusedVertices(const Dune::CpGrid& grid, int level, bool cornersOnly = false)
+{
+    const auto& all = grid.currentData();
+    const auto& data = *all[level < 0 ? all.size() - 1 : level];
+    std::vector<char> used(data.size(3), 0);
+    for (int face = 0; face < data.numFaces() && !cornersOnly; ++face) {
+        for (const int p : data.faceToPoint(face)) {
+            used[p] = 1;
+        }
+    }
+    for (int cell = 0; cell < data.size(0); ++cell) {
+        for (const int p : data.cellToPoint(cell)) {
+            used[p] = 1;
+        }
+    }
+    return static_cast<int>(std::count(used.begin(), used.end(), 0));
+}
+} // anonymous namespace
+
+// Where two fault faces' edges cross, level zero has a vertex that is no cell's corner.
+// Refining both sides replaces those faces, and the leaf must not keep the vertex.
+BOOST_AUTO_TEST_CASE(leafDropsVerticesOfReplacedFaces)
+{
+    // The middle layer boundary rises along y left of the fault plane x=2 and falls right of it.
+    auto depth = [](int i_, int j_, int k_) {
+        const int layer = cellOf(k_) + sideOf(k_);
+        if (layer != 1) {
+            return 1.0*layer;
+        }
+        const double y = cellOf(j_) + sideOf(j_);
+        return (cellOf(i_) < 2) ? 0.6 + 0.8*y : 1.4 - 0.8*y;
+    };
+    auto parent = makeVerticalPillarGrid({4, 1, 2}, depth);
+
+    Dune::CpGrid grid;
+    auto rawParent = parent.raw();
+    grid.processEclipseFormat(rawParent, false);
+    const double volumeBefore = totalVolume(grid);
+    BOOST_REQUIRE_GT(unusedVertices(grid, 0, true), 0);
+
+    useConformingBuilder(grid, std::make_unique<Opm::Refinement::ConformingBlockBuilder>(
+        parent.dims, parent.coord, parent.zcorn, parent.actnum));
+    grid.addLgrsUpdateLeafView({{2,3,2}}, {{1,0,0}}, {{3,1,2}}, {"LGR1"});
+
+    BOOST_REQUIRE_EQUAL(grid.maxLevel(), 1);
+    BOOST_CHECK_CLOSE(totalVolume(grid), volumeBefore, 1e-8);
+    BOOST_CHECK_EQUAL(unusedVertices(grid, -1), 0);
+}
+
+namespace
+{
+// Pairs of distinct leaf vertices, used by some face, closer than 1e-8 m.
+int coincidentLeafVertices(const Dune::CpGrid& grid)
+{
+    const auto& leaf = *grid.currentData().back();
+    std::vector<int> used;
+    std::vector<char> seen(leaf.size(3), 0);
+    for (int face = 0; face < leaf.numFaces(); ++face) {
+        for (const int p : leaf.faceToPoint(face)) {
+            if (!seen[p]) {
+                seen[p] = 1;
+                used.push_back(p);
+            }
+        }
+    }
+    int pairs = 0;
+    for (std::size_t a = 0; a < used.size(); ++a) {
+        for (std::size_t b = a + 1; b < used.size(); ++b) {
+            auto d = grid.vertexPosition(used[a]);
+            d -= grid.vertexPosition(used[b]);
+            pairs += (d.two_norm() < 1e-8) ? 1 : 0;
+        }
+    }
+    return pairs;
+}
+} // anonymous namespace
+
+// A throw of half a layer puts corners across the fault on the refined sub-layer
+// boundary, up to rounding; each such position must be one leaf vertex.
+BOOST_AUTO_TEST_CASE(throwOnSubLayerBoundaryGivesOneVertexPerPosition)
+{
+    for (const double thickness : {0.3048*20.0, 3.7, 1.1}) {
+        auto depth = [thickness](int i_, int, int k_) {
+            const double z = 2537.46 + 0.17*(cellOf(i_) + sideOf(i_))
+                           + thickness*(cellOf(k_) + sideOf(k_));
+            return (cellOf(i_) >= 2) ? z + 0.5*thickness : z;
+        };
+        auto parent = makeVerticalPillarGrid({4, 2, 4}, depth);
+
+        Dune::CpGrid grid;
+        auto rawParent = parent.raw();
+        grid.processEclipseFormat(rawParent, false);
+        const double volumeBefore = totalVolume(grid);
+
+        useConformingBuilder(grid, std::make_unique<Opm::Refinement::ConformingBlockBuilder>(
+            parent.dims, parent.coord, parent.zcorn, parent.actnum));
+        grid.addLgrsUpdateLeafView({{3,3,2}}, {{0,0,1}}, {{2,2,3}}, {"LGR1"});
+
+        BOOST_REQUIRE_EQUAL(grid.maxLevel(), 1);
+        BOOST_CHECK_CLOSE(totalVolume(grid), volumeBefore, 1e-8);
+        BOOST_CHECK_EQUAL(coincidentLeafVertices(grid), 0);
+    }
 }
 
 BOOST_AUTO_TEST_CASE(processGrdeclSplitsFaultedCoarseFineColumnPair)
@@ -1593,4 +1759,101 @@ BOOST_AUTO_TEST_CASE(skewPillarStackedBoxesShareRefinedPillars)
         return 2.0*k + 0.3*((i_ + 1)/2 + (j_ + 1)/2)*k*k;
     });
     BOOST_CHECK(coordOf(thickening, 0, 2) == coordOf(thickening, 2, 4));
+}
+
+// A box refined 1x1x1 at a fault with partial throw must reproduce level-0 face centres: the
+// refined cell measures to its own face, not to the smaller piece it shares across the fault.
+namespace
+{
+// Leaf cells with an edge that only one of their faces has (a hanging node).
+int cellsWithLoneEdge(const Dune::CpGrid& grid)
+{
+    int cells = 0;
+    for (int c = 0; c < grid.numCells(); ++c) {
+        std::map<std::pair<int,int>, int> edges;
+        for (int lf = 0; lf < grid.numCellFaces(c); ++lf) {
+            const int face = grid.cellFace(c, lf);
+            const int n = grid.numFaceVertices(face);
+            for (int v = 0; v < n; ++v) {
+                const int a = grid.faceVertex(face, v);
+                const int b = grid.faceVertex(face, (v + 1) % n);
+                ++edges[{std::min(a, b), std::max(a, b)}];
+            }
+        }
+        cells += std::any_of(edges.begin(), edges.end(),
+                             [](const auto& e) { return e.second != 2; }) ? 1 : 0;
+    }
+    return cells;
+}
+} // anonymous namespace
+
+// Converging pillars and curved layers: a fault plane meets a layer boundary along
+// a curve, so the refined intersection nodes miss the level-zero straight edge.
+BOOST_AUTO_TEST_CASE(edgeConformalLeafClosesCurvedFaultIntersection)
+{
+    auto depth = [](int i_, int j_, int k_) {
+        const double x = cellOf(i_) + sideOf(i_);
+        const double y = cellOf(j_) + sideOf(j_);
+        const double z = 1.0*(cellOf(k_) + sideOf(k_)) + 0.13*x + 0.07*y + 0.05*x*y;
+        return (cellOf(i_) >= 2) ? z + 0.37 : z;
+    };
+    auto parent = makeSkewPillarGrid({4, 3, 4}, depth);
+
+    Dune::CpGrid grid;
+    auto rawParent = parent.raw();
+    grid.processEclipseFormat(rawParent, false, false, true);
+    const double volumeBefore = totalVolume(grid);
+    BOOST_REQUIRE_EQUAL(cellsWithLoneEdge(grid), 0);
+
+    useConformingBuilder(grid, std::make_unique<Opm::Refinement::ConformingBlockBuilder>(
+        parent.dims, parent.coord, parent.zcorn, parent.actnum, true));
+    grid.addLgrsUpdateLeafView({{3,3,3}}, {{2,0,1}}, {{4,3,3}}, {"LGR1"});
+
+    BOOST_REQUIRE_EQUAL(grid.maxLevel(), 1);
+    BOOST_CHECK_CLOSE(totalVolume(grid), volumeBefore, 1e-4);   // percent; curved cells
+    BOOST_CHECK_EQUAL(cellsWithLoneEdge(grid), 0);
+}
+
+BOOST_AUTO_TEST_CASE(unitRefinementAtFaultKeepsCellFaceCentres)
+{
+    auto depth = [](int i_, int, int k_) {
+        const double base = 2.0*(cellOf(k_) + sideOf(k_));
+        return (cellOf(i_) >= 2) ? base + 0.6 : base;     // fault between i=1 and i=2
+    };
+    auto parent = makeVerticalPillarGrid({4, 2, 2}, depth);
+    Dune::CpGrid grid;
+    auto raw = parent.raw();
+    grid.processEclipseFormat(raw, false);
+    useConformingBuilder(grid, std::make_unique<Opm::Refinement::ConformingBlockBuilder>(
+        parent.dims, parent.coord, parent.zcorn, parent.actnum));
+    grid.addLgrsUpdateLeafView({{1,1,1}}, {{0,0,0}}, {{2,2,2}}, {"LGR1"});
+
+    int acrossFault = 0, pieceCentreDiffers = 0;
+    for (const auto& element : Dune::elements(grid.leafGridView())) {
+        if (element.level() == 0) {
+            continue;
+        }
+        for (const auto& is : Dune::intersections(grid.leafGridView(), element)) {
+            if (!is.neighbor() || is.outside().level() != 0) {
+                continue;
+            }
+            const int face = is.indexInInside();
+            Dune::FieldVector<double,3> expected(0.0);
+            for (int corner = 0; corner < 8; ++corner) {
+                if (((corner >> (face / 2)) & 1) == face % 2) {
+                    expected.axpy(0.25, element.geometry().corner(corner));
+                }
+            }
+            const auto center = grid.faceCenterEcl(element.index(), face, is);
+            for (int d = 0; d < 3; ++d) {
+                BOOST_CHECK_SMALL(center[d] - expected[d], 1e-12);
+            }
+            if (face == 1) {
+                ++acrossFault;
+                pieceCentreDiffers += (is.geometry().center() - expected).two_norm() > 0.1;
+            }
+        }
+    }
+    BOOST_CHECK_GT(acrossFault, 0);
+    BOOST_CHECK_GT(pieceCentreDiffers, 0);  // the shared pieces really are offset by the throw
 }

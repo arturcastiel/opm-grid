@@ -35,9 +35,12 @@
 #include <dune/common/parallel/mpihelper.hh>
 
 #include <array>
+#include <exception>
 #include <map>
+#include <memory>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -282,6 +285,22 @@ void ConformingBlockBuilder::build(Dune::CpGrid& grid,
     }
 
     auto& storage = grid.currentData();
+    // A throw from here on must leave the grid as it was: drop the new levels and leaf.
+    struct RestoreOnThrow
+    {
+        std::vector<std::shared_ptr<Dune::cpgrid::CpGridData>>& storage;
+        std::size_t size = storage.size();
+        std::vector<std::tuple<int, std::vector<int>>> parentToChildren0
+            = storage.front()->getParentToChildren();
+        int pending = std::uncaught_exceptions();
+        ~RestoreOnThrow()
+        {
+            if (std::uncaught_exceptions() > pending) {
+                storage.resize(size);
+                GridStateWriter::setParentToChildren(*storage.front(), std::move(parentToChildren0));
+            }
+        }
+    } restoreOnThrow{storage};
     // The refinement is "distributed" (rank-interior: only the owning rank
     // refines each box) only once the grid has actually been scattered. Before
     // load balancing - the refine-before-redistribute path - the grid is still
@@ -382,7 +401,8 @@ void ConformingBlockBuilder::build(Dune::CpGrid& grid,
                 ? assembleBlockLevelGrid(*storage[parentLevel], pg.dims,
                                          pg.coord, pg.zcorn, pg.actnum,
                                          req, static_cast<int>(b) + 1, parentLevel,
-                                         storage, comm, &childRefined)
+                                         storage, comm, &childRefined,
+                                         input_->pinchActive || input_->edgeConformal)
                 : assembleEmptyLevelGrid(req, static_cast<int>(b) + 1, storage, comm);
             storage.push_back(std::move(level));
             levelGeom[b + 1] = LevelGeom{ childRefined.dims,
@@ -415,18 +435,42 @@ void ConformingBlockBuilder::build(Dune::CpGrid& grid,
                 : ("Parallel LGR build aborted on rank " + std::to_string(cc.rank())
                    + " because another rank failed (see that rank's message).")));
         }
-    } else {
+    } else if (!refineBefore) {
         buildLevelGrids();
     }
 
-    std::shared_ptr<Dune::cpgrid::CpGridData> leaf =
-        assembleLeafGrid(storage, requests, dims,
-                         input_->coord.data(), input_->zcorn.data(), actnum0,
-                         comm);
-    if (input_->edgeConformal) {
-        edgeConformalizeLeaf(*leaf);
+    const auto buildLeaf = [&] {
+        std::shared_ptr<Dune::cpgrid::CpGridData> leaf =
+            assembleLeafGrid(storage, requests, dims,
+                             input_->coord.data(), input_->zcorn.data(), actnum0,
+                             comm);
+        if (input_->edgeConformal) {
+            edgeConformalizeLeaf(*leaf);
+        }
+        storage.push_back(std::move(leaf));
+    };
+
+    if (refineBefore) {
+        // Only rank 0 refines here, on a self communicator: tell the others if it failed.
+        int localError = 0;
+        std::string localMsg;
+        try {
+            buildLevelGrids();
+            buildLeaf();
+        } catch (const std::exception& e) {
+            localError = 1;
+            localMsg = e.what();
+        }
+        Dune::Communication<Dune::MPIHelper::MPICommunicator> wc(worldComm);
+        if (wc.max(localError) != 0) {
+            OPM_THROW(std::runtime_error, (localError != 0
+                ? ("LGR build failed on rank " + std::to_string(wc.rank()) + ": " + localMsg)
+                : ("LGR build aborted on rank " + std::to_string(wc.rank())
+                   + " because another rank failed (see that rank's message).")));
+        }
+    } else {
+        buildLeaf();
     }
-    storage.push_back(std::move(leaf));
 
     if (refineBefore) {
         // The new level grids (indices 1..N) and the leaf (back) were assembled
