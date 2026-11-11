@@ -304,14 +304,19 @@ namespace Opm
 namespace Refinement
 {
 
+namespace
+{
+
+// collective: this rank has reached the cross-rank agreement in the leaf assembly.
 std::shared_ptr<CpGridData>
-assembleLeafGrid(std::vector<std::shared_ptr<CpGridData>>& storage,
-                 const std::vector<BlockRefinement>& requests,
-                 const std::array<int,3>& parentDims,
-                 const double* coord,
-                 const double* zcorn,
-                 const int* actnum,
-                 Dune::MPIHelper::MPICommunicator comm)
+assembleLeafGridImpl(std::vector<std::shared_ptr<CpGridData>>& storage,
+                     const std::vector<BlockRefinement>& requests,
+                     const std::array<int,3>& parentDims,
+                     const double* coord,
+                     const double* zcorn,
+                     const int* actnum,
+                     Dune::MPIHelper::MPICommunicator comm,
+                     bool& collective)
 {
     CpGridData& level0 = *storage[0];
     const int numBoxes = static_cast<int>(requests.size());
@@ -1673,6 +1678,12 @@ assembleLeafGrid(std::vector<std::shared_ptr<CpGridData>>& storage,
     // Coarse leaf cells inherit their level-zero global index and attribute;
     // refined cells are rank-interior (owner only) and get assignRefinedIds' ids,
     // which are above every coarse global id.
+    // Agree before the first collective; a rank that failed earlier joins from the wrapper.
+    collective = true;
+    if (Dune::Communication<Dune::MPIHelper::MPICommunicator>(comm).max(0) != 0) {
+        OPM_THROW(std::runtime_error, "LGR leaf assembly aborted because another rank failed"
+                  " (see that rank's message).");
+    }
     const auto ids = assignRefinedIds(storage, numBoxes, leafToLevel, leafCornerHistory,
                                       splitKeys, comm);
 #if HAVE_MPI
@@ -1743,6 +1754,29 @@ assembleLeafGrid(std::vector<std::shared_ptr<CpGridData>>& storage,
     }
 
     return leaf;
+}
+
+} // anonymous namespace
+
+std::shared_ptr<CpGridData>
+assembleLeafGrid(std::vector<std::shared_ptr<CpGridData>>& storage,
+                 const std::vector<BlockRefinement>& requests,
+                 const std::array<int,3>& parentDims,
+                 const double* coord,
+                 const double* zcorn,
+                 const int* actnum,
+                 Dune::MPIHelper::MPICommunicator comm)
+{
+    bool collective = false;
+    try {
+        return assembleLeafGridImpl(storage, requests, parentDims, coord, zcorn, actnum,
+                                    comm, collective);
+    } catch (...) {
+        if (!collective) {
+            Dune::Communication<Dune::MPIHelper::MPICommunicator>(comm).max(1);
+        }
+        throw;
+    }
 }
 
 } // namespace Refinement

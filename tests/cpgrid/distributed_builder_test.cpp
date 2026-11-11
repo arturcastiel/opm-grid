@@ -450,6 +450,32 @@ BOOST_AUTO_TEST_CASE(boxTouchingOverlapThrows)
     BOOST_CHECK_THROW(grid.addLgrsUpdateLeafView({{2,2,2}}, {{5,1,0}}, {{8,3,2}}, {"LGR1"}),
                       std::runtime_error);  // rethrown collectively on every rank
 }
+
+// A refusal in the leaf assembly on the one rank that owns the boxes must stop every rank.
+BOOST_AUTO_TEST_CASE(leafRefusalOnOneRankThrowsOnAll)
+{
+    const std::array<int,3> dims = {{12, 4, 2}};
+    auto g = makeUnitGrid(dims);
+
+    Dune::CpGrid grid;
+    grid.createCartesian(dims, {{1.0, 1.0, 1.0}});
+    if (grid.comm().size() != 2) {
+        return;
+    }
+    std::vector<int> parts(static_cast<std::size_t>(dims[0])*dims[1]*dims[2]);
+    for (std::size_t c = 0; c < parts.size(); ++c) {
+        parts[c] = (static_cast<int>(c) % dims[0] < 6) ? 0 : 1;
+    }
+    grid.loadBalance(parts, false, true, 2);
+    useConformingBuilder(grid, std::make_unique<Opm::Refinement::ConformingBlockBuilder>(
+        g.dims, g.coord, g.zcorn, g.actnum));
+
+    // Touching boxes in rank 1's interior, one graded: only the leaf assembly refuses that.
+    Opm::Refinement::BlockRefinement graded{"A", "GLOBAL", {2,2,2}, {7,1,0}, {9,3,2}};
+    graded.subdivision[0] = { {0, 0, 1, 1, 1}, {0.0, 0.5, 0.0, 0.3, 0.6}, {0.5, 1.0, 0.3, 0.6, 1.0} };
+    const Opm::Refinement::BlockRefinement uniform{"B", "GLOBAL", {2,2,2}, {9,1,0}, {11,3,2}};
+    BOOST_CHECK_THROW(grid.addLgrsUpdateLeafView(std::vector{graded, uniform}), std::exception);
+}
 #endif // HAVE_MPI
 
 // A deck-built Conforming grid refines after loadBalance() from the input rank 0 retained.

@@ -416,18 +416,42 @@ void ConformingBlockBuilder::build(Dune::CpGrid& grid,
                 : ("Parallel LGR build aborted on rank " + std::to_string(cc.rank())
                    + " because another rank failed (see that rank's message).")));
         }
-    } else {
+    } else if (!refineBefore) {
         buildLevelGrids();
     }
 
-    std::shared_ptr<Dune::cpgrid::CpGridData> leaf =
-        assembleLeafGrid(storage, requests, dims,
-                         input_->coord.data(), input_->zcorn.data(), actnum0,
-                         comm);
-    if (input_->edgeConformal) {
-        edgeConformalizeLeaf(*leaf);
+    const auto buildLeaf = [&] {
+        std::shared_ptr<Dune::cpgrid::CpGridData> leaf =
+            assembleLeafGrid(storage, requests, dims,
+                             input_->coord.data(), input_->zcorn.data(), actnum0,
+                             comm);
+        if (input_->edgeConformal) {
+            edgeConformalizeLeaf(*leaf);
+        }
+        storage.push_back(std::move(leaf));
+    };
+
+    if (refineBefore) {
+        // Only rank 0 refines here, on a self communicator: tell the others if it failed.
+        int localError = 0;
+        std::string localMsg;
+        try {
+            buildLevelGrids();
+            buildLeaf();
+        } catch (const std::exception& e) {
+            localError = 1;
+            localMsg = e.what();
+        }
+        Dune::Communication<Dune::MPIHelper::MPICommunicator> wc(worldComm);
+        if (wc.max(localError) != 0) {
+            OPM_THROW(std::runtime_error, (localError != 0
+                ? ("LGR build failed on rank " + std::to_string(wc.rank()) + ": " + localMsg)
+                : ("LGR build aborted on rank " + std::to_string(wc.rank())
+                   + " because another rank failed (see that rank's message).")));
+        }
+    } else {
+        buildLeaf();
     }
-    storage.push_back(std::move(leaf));
 
     if (refineBefore) {
         // The new level grids (indices 1..N) and the leaf (back) were assembled
