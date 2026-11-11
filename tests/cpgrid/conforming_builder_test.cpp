@@ -1197,6 +1197,29 @@ BOOST_AUTO_TEST_CASE(faultLargeThrowAtBoxBoundaryBuilds)
     checkValidFaultedLeaf(grid, volumeBefore);
 }
 
+// A throw of half a layer puts the thrown depths on the box's sub-layer boundary, equal
+// only up to rounding (feet converted to metres, dipping layers).
+BOOST_AUTO_TEST_CASE(faultThrowOnSubLayerBoundaryBuilds)
+{
+    auto depth = [](int i_, int, int k_) {
+        const double ft = 0.3048;
+        const double z = ft*(8325.0 + 6.0*(cellOf(i_) + sideOf(i_)) + 20.0*(cellOf(k_) + sideOf(k_)));
+        return (cellOf(i_) >= 2) ? z + 10.0*ft : z;
+    };
+    auto parent = makeVerticalPillarGrid({4, 2, 4}, depth);
+
+    Dune::CpGrid grid;
+    auto rawParent = parent.raw();
+    grid.processEclipseFormat(rawParent, false);
+    const double volumeBefore = totalVolume(grid);
+
+    useConformingBuilder(grid, std::make_unique<Opm::Refinement::ConformingBlockBuilder>(
+        parent.dims, parent.coord, parent.zcorn, parent.actnum));
+
+    BOOST_REQUIRE_NO_THROW(grid.addLgrsUpdateLeafView({{3,3,2}}, {{0,0,1}}, {{2,2,3}}, {"LGR1"}));
+    checkValidFaultedLeaf(grid, volumeBefore);
+}
+
 namespace
 {
 
