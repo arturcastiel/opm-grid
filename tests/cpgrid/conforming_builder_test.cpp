@@ -1457,6 +1457,61 @@ BOOST_AUTO_TEST_CASE(leafDropsVerticesOfReplacedFaces)
     BOOST_CHECK_EQUAL(unusedVertices(grid, -1), 0);
 }
 
+namespace
+{
+// Pairs of distinct leaf vertices, used by some face, closer than 1e-8 m.
+int coincidentLeafVertices(const Dune::CpGrid& grid)
+{
+    const auto& leaf = *grid.currentData().back();
+    std::vector<int> used;
+    std::vector<char> seen(leaf.size(3), 0);
+    for (int face = 0; face < leaf.numFaces(); ++face) {
+        for (const int p : leaf.faceToPoint(face)) {
+            if (!seen[p]) {
+                seen[p] = 1;
+                used.push_back(p);
+            }
+        }
+    }
+    int pairs = 0;
+    for (std::size_t a = 0; a < used.size(); ++a) {
+        for (std::size_t b = a + 1; b < used.size(); ++b) {
+            auto d = grid.vertexPosition(used[a]);
+            d -= grid.vertexPosition(used[b]);
+            pairs += (d.two_norm() < 1e-8) ? 1 : 0;
+        }
+    }
+    return pairs;
+}
+} // anonymous namespace
+
+// A throw of half a layer puts corners across the fault on the refined sub-layer
+// boundary, up to rounding; each such position must be one leaf vertex.
+BOOST_AUTO_TEST_CASE(throwOnSubLayerBoundaryGivesOneVertexPerPosition)
+{
+    for (const double thickness : {0.3048*20.0, 3.7, 1.1}) {
+        auto depth = [thickness](int i_, int, int k_) {
+            const double z = 2537.46 + 0.17*(cellOf(i_) + sideOf(i_))
+                           + thickness*(cellOf(k_) + sideOf(k_));
+            return (cellOf(i_) >= 2) ? z + 0.5*thickness : z;
+        };
+        auto parent = makeVerticalPillarGrid({4, 2, 4}, depth);
+
+        Dune::CpGrid grid;
+        auto rawParent = parent.raw();
+        grid.processEclipseFormat(rawParent, false);
+        const double volumeBefore = totalVolume(grid);
+
+        useConformingBuilder(grid, std::make_unique<Opm::Refinement::ConformingBlockBuilder>(
+            parent.dims, parent.coord, parent.zcorn, parent.actnum));
+        grid.addLgrsUpdateLeafView({{3,3,2}}, {{0,0,1}}, {{2,2,3}}, {"LGR1"});
+
+        BOOST_REQUIRE_EQUAL(grid.maxLevel(), 1);
+        BOOST_CHECK_CLOSE(totalVolume(grid), volumeBefore, 1e-8);
+        BOOST_CHECK_EQUAL(coincidentLeafVertices(grid), 0);
+    }
+}
+
 BOOST_AUTO_TEST_CASE(processGrdeclSplitsFaultedCoarseFineColumnPair)
 {
     // The faces at a faulted box boundary are built by running process_grdecl on
