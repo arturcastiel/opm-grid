@@ -528,3 +528,131 @@ PORO
     BOOST_CHECK_EQUAL(grid.comm().sum(interior), 180 - 2 + 4);
     BOOST_CHECK_EQUAL(grid.comm().sum(refined), 4);
 }
+
+namespace
+{
+// Counts, per leaf vertex, the messages received over a codim-3 interface.
+class VertexReached
+{
+public:
+    using DataType = int;
+    VertexReached(const Dune::CpGrid& grid, std::vector<int>& received)
+        : grid_(grid), received_(received) {}
+    bool fixedSize(int, int) { return true; }
+    bool contains(int dim, int codim) { return dim == 3 && codim == 3; }
+    template<class T> std::size_t size(const T&) { return 1; }
+    template<class B, class T> void gather(B& buffer, const T&) { buffer.write(1); }
+    template<class B, class T> void scatter(B& buffer, const T& t, std::size_t)
+    {
+        int x = 0;
+        buffer.read(x);
+        ++received_[grid_.leafIndexSet().index(t)];
+    }
+private:
+    const Dune::CpGrid& grid_;
+    std::vector<int>& received_;
+};
+} // namespace
+
+// Refine-before-distribute on a faulted grid, with the partition cutting the box and the fault:
+// every shared leaf vertex is communicated, has one id and position, and one owner.
+BOOST_AUTO_TEST_CASE(faultedRefinedLeafVerticesCommunicated)
+{
+    const std::array<int,3> dims = {{8, 8, 2}};
+    const auto g = makeFaultedGrid(dims, 4, 0.6);
+    std::ostringstream deckString;
+    deckString << "RUNSPEC\nDIMENS\n 8 8 2 /\nGRID\nCOORD\n";
+    for (const double v : g.coord) {
+        deckString << ' ' << v;
+    }
+    deckString << " /\nZCORN\n";
+    for (const double v : g.zcorn) {
+        deckString << ' ' << v;
+    }
+    deckString << " /\nPORO\n 128*0.2 /\nCARFIN\n'LGR1' 2 4 1 2 1 2 6 4 4 /\nENDFIN\n";
+    const auto deck = Opm::Parser{}.parseString(deckString.str());
+    Opm::EclipseState state(deck);
+    auto eclGrid = state.getInputGrid();
+
+    for (const bool edgeConformal : {false, true}) {
+        Dune::CpGrid grid;
+        const int np = grid.comm().size();
+        if (np < 2) {
+            return;
+        }
+        grid.setLgrBackend(Opm::Refinement::Backend::Conforming);
+        grid.processEclipseFormat(&eclGrid, &state, false, false, false, false, edgeConformal);
+        grid.addLgrsUpdateLeafView({{2,2,2}}, {{1,0,0}}, {{4,2,2}}, {"LGR1"}); // high side on the fault
+        const int leafCells = grid.comm().max(grid.size(0)); // refined on rank 0 only
+
+        std::vector<int> parts(leafCells);
+        for (const auto& e : Dune::elements(grid.leafGridView())) {
+            const auto x = e.geometry().center();
+            parts[grid.leafGridView().indexSet().index(e)] = (x[1] < 1.0) ? 0 : (x[0] < 4.0 || np < 3) ? 1
+                : 2 + (np > 3 && x[1] >= 4.0);
+        }
+        grid.loadBalance(parts, false, true, 1);
+
+        std::vector<int> received(grid.size(3), 0);
+        VertexReached handle(grid, received);
+        grid.communicate(handle, Dune::All_All_Interface, Dune::ForwardCommunication);
+
+        int unreached = 0;
+        std::vector<double> mine; // id, x, y, z, partition type
+        const auto& ids = grid.globalIdSet();
+        for (const auto& v : Dune::vertices(grid.leafGridView())) {
+            unreached += v.partitionType() != Dune::InteriorEntity && received[grid.leafIndexSet().index(v)] == 0;
+            const auto x = v.geometry().center();
+            mine.insert(mine.end(), {static_cast<double>(ids.id(v)), x[0], x[1], x[2],
+                                     static_cast<double>(v.partitionType())});
+        }
+        const int n = static_cast<int>(mine.size());
+        std::vector<int> counts(np);
+        grid.comm().allgather(&n, 1, counts.data());
+        std::vector<int> displ(np + 1, 0);
+        for (int r = 0; r < np; ++r) {
+            displ[r + 1] = displ[r] + counts[r];
+        }
+        std::vector<double> all(displ[np]);
+        grid.comm().allgatherv(mine.data(), n, all.data(), counts.data(), displ.data());
+
+        std::map<long, std::array<double,3>> posOfId;
+        std::map<std::array<long,3>, long> idOfPos;
+        std::map<long, std::array<int,2>> owners;
+        int idClash = 0, posClash = 0;
+        for (std::size_t e = 0; e < all.size(); e += 5) {
+            const long id = static_cast<long>(all[e]);
+            const std::array<double,3> x {all[e+1], all[e+2], all[e+3]};
+            const auto [it, fresh] = posOfId.emplace(id, x);
+            idClash += !fresh && std::abs(it->second[0]-x[0]) + std::abs(it->second[1]-x[1])
+                + std::abs(it->second[2]-x[2]) > 1e-9;
+            const auto [pit, pfresh] = idOfPos.emplace(std::array<long,3>{std::lround(x[0]*1e6),
+                                                       std::lround(x[1]*1e6), std::lround(x[2]*1e6)}, id);
+            posClash += !pfresh && pit->second != id;
+            const auto type = static_cast<Dune::PartitionType>(static_cast<int>(all[e+4]));
+            owners[id][0] += type == Dune::InteriorEntity;
+            owners[id][1] += type == Dune::BorderEntity;
+        }
+        int badOwner = 0;
+        for (const auto& [id, o] : owners) {
+            badOwner += !((o[0] == 1 && o[1] == 0) || (o[0] == 0 && o[1] >= 1));
+        }
+        int interior = 0;
+        for ([[maybe_unused]] const auto& e : Dune::elements(grid.leafGridView(), Dune::Partitions::interior)) {
+            ++interior;
+        }
+        unreached = grid.comm().sum(unreached);
+        interior = grid.comm().sum(interior);
+        if (grid.comm().rank() == 0) {
+            std::cout << "edge-conformal " << edgeConformal << ": " << owners.size() << " vertex ids, "
+                      << idOfPos.size() << " positions, unreached " << unreached
+                      << ", id clash " << idClash << ", position clash " << posClash
+                      << ", bad owner " << badOwner << std::endl;
+        }
+        BOOST_CHECK_EQUAL(unreached, 0);
+        BOOST_CHECK_EQUAL(idClash, 0);
+        BOOST_CHECK_EQUAL(posClash, 0);
+        BOOST_CHECK_EQUAL(badOwner, 0);
+        BOOST_CHECK_EQUAL(interior, leafCells);
+    }
+}
