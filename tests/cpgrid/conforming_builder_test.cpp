@@ -1763,6 +1763,57 @@ BOOST_AUTO_TEST_CASE(skewPillarStackedBoxesShareRefinedPillars)
 
 // A box refined 1x1x1 at a fault with partial throw must reproduce level-0 face centres: the
 // refined cell measures to its own face, not to the smaller piece it shares across the fault.
+namespace
+{
+// Leaf cells with an edge that only one of their faces has (a hanging node).
+int cellsWithLoneEdge(const Dune::CpGrid& grid)
+{
+    int cells = 0;
+    for (int c = 0; c < grid.numCells(); ++c) {
+        std::map<std::pair<int,int>, int> edges;
+        for (int lf = 0; lf < grid.numCellFaces(c); ++lf) {
+            const int face = grid.cellFace(c, lf);
+            const int n = grid.numFaceVertices(face);
+            for (int v = 0; v < n; ++v) {
+                const int a = grid.faceVertex(face, v);
+                const int b = grid.faceVertex(face, (v + 1) % n);
+                ++edges[{std::min(a, b), std::max(a, b)}];
+            }
+        }
+        cells += std::any_of(edges.begin(), edges.end(),
+                             [](const auto& e) { return e.second != 2; }) ? 1 : 0;
+    }
+    return cells;
+}
+} // anonymous namespace
+
+// Converging pillars and curved layers: a fault plane meets a layer boundary along
+// a curve, so the refined intersection nodes miss the level-zero straight edge.
+BOOST_AUTO_TEST_CASE(edgeConformalLeafClosesCurvedFaultIntersection)
+{
+    auto depth = [](int i_, int j_, int k_) {
+        const double x = cellOf(i_) + sideOf(i_);
+        const double y = cellOf(j_) + sideOf(j_);
+        const double z = 1.0*(cellOf(k_) + sideOf(k_)) + 0.13*x + 0.07*y + 0.05*x*y;
+        return (cellOf(i_) >= 2) ? z + 0.37 : z;
+    };
+    auto parent = makeSkewPillarGrid({4, 3, 4}, depth);
+
+    Dune::CpGrid grid;
+    auto rawParent = parent.raw();
+    grid.processEclipseFormat(rawParent, false, false, true);
+    const double volumeBefore = totalVolume(grid);
+    BOOST_REQUIRE_EQUAL(cellsWithLoneEdge(grid), 0);
+
+    useConformingBuilder(grid, std::make_unique<Opm::Refinement::ConformingBlockBuilder>(
+        parent.dims, parent.coord, parent.zcorn, parent.actnum, true));
+    grid.addLgrsUpdateLeafView({{3,3,3}}, {{2,0,1}}, {{4,3,3}}, {"LGR1"});
+
+    BOOST_REQUIRE_EQUAL(grid.maxLevel(), 1);
+    BOOST_CHECK_CLOSE(totalVolume(grid), volumeBefore, 1e-4);   // percent; curved cells
+    BOOST_CHECK_EQUAL(cellsWithLoneEdge(grid), 0);
+}
+
 BOOST_AUTO_TEST_CASE(unitRefinementAtFaultKeepsCellFaceCentres)
 {
     auto depth = [](int i_, int, int k_) {

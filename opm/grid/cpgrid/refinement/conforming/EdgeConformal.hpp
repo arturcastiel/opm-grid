@@ -46,7 +46,8 @@ namespace Refinement
 /// cell geometry, face area and normal are unchanged. Only corners some face
 /// uses are inserted. Each face edge looks at the corners in the buckets its
 /// bounding box covers, with buckets sized per direction to hold about one
-/// corner each.
+/// corner each. A node off the straight edge is inserted only when the face's
+/// cell reaches the edge's ends through it on its other faces.
 void edgeConformalizeLeaf(Dune::cpgrid::CpGridData& leaf);
 
 } // namespace Refinement
