@@ -1178,9 +1178,8 @@ const Dune::FieldVector<double,3> CpGrid::faceCenterEcl(int cell_index, int face
     };
 
     assert (current_data_->back()->cell_to_point_[cell_index].size() == 8);
-    if (lgr_backend_ == Opm::Refinement::Backend::Conforming && maxLevel() > 0) {
-        return faceCenterEclConforming_(cell_index, face, intersection);
-    }
+    // Conforming LGR cells are corner-point cells: measure every cell to its own face, as level 0 does.
+    const bool conforming = lgr_backend_ == Opm::Refinement::Backend::Conforming;
     Dune::FieldVector<double,3> center(0.0);
 
     bool isCoarseCellInside = (intersection.inside().level() == 0);
@@ -1201,7 +1200,7 @@ const Dune::FieldVector<double,3> CpGrid::faceCenterEcl(int cell_index, int face
     // the notation used in faceVxMap.
 
     for( int i=0; i<4; ++i ) {
-        if ((maxLevel() == 0) || twoCoarseNeighboringCells || isOnGridBoundary_coarseNeighboringCell) {
+        if (conforming || (maxLevel() == 0) || twoCoarseNeighboringCells || isOnGridBoundary_coarseNeighboringCell) {
             center += vertexPosition(current_data_->back()->cell_to_point_[cell_index][ faceVxMap[ face ][ i ] ]);
         }
         else { //  (refined) intersection with one coarse neighboring cell and one refined neighboring cell

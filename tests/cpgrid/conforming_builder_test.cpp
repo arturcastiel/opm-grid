@@ -1594,3 +1594,49 @@ BOOST_AUTO_TEST_CASE(skewPillarStackedBoxesShareRefinedPillars)
     });
     BOOST_CHECK(coordOf(thickening, 0, 2) == coordOf(thickening, 2, 4));
 }
+
+// A box refined 1x1x1 at a fault with partial throw must reproduce level-0 face centres: the
+// refined cell measures to its own face, not to the smaller piece it shares across the fault.
+BOOST_AUTO_TEST_CASE(unitRefinementAtFaultKeepsCellFaceCentres)
+{
+    auto depth = [](int i_, int, int k_) {
+        const double base = 2.0*(cellOf(k_) + sideOf(k_));
+        return (cellOf(i_) >= 2) ? base + 0.6 : base;     // fault between i=1 and i=2
+    };
+    auto parent = makeVerticalPillarGrid({4, 2, 2}, depth);
+    Dune::CpGrid grid;
+    auto raw = parent.raw();
+    grid.processEclipseFormat(raw, false);
+    useConformingBuilder(grid, std::make_unique<Opm::Refinement::ConformingBlockBuilder>(
+        parent.dims, parent.coord, parent.zcorn, parent.actnum));
+    grid.addLgrsUpdateLeafView({{1,1,1}}, {{0,0,0}}, {{2,2,2}}, {"LGR1"});
+
+    int acrossFault = 0, pieceCentreDiffers = 0;
+    for (const auto& element : Dune::elements(grid.leafGridView())) {
+        if (element.level() == 0) {
+            continue;
+        }
+        for (const auto& is : Dune::intersections(grid.leafGridView(), element)) {
+            if (!is.neighbor() || is.outside().level() != 0) {
+                continue;
+            }
+            const int face = is.indexInInside();
+            Dune::FieldVector<double,3> expected(0.0);
+            for (int corner = 0; corner < 8; ++corner) {
+                if (((corner >> (face / 2)) & 1) == face % 2) {
+                    expected.axpy(0.25, element.geometry().corner(corner));
+                }
+            }
+            const auto center = grid.faceCenterEcl(element.index(), face, is);
+            for (int d = 0; d < 3; ++d) {
+                BOOST_CHECK_SMALL(center[d] - expected[d], 1e-12);
+            }
+            if (face == 1) {
+                ++acrossFault;
+                pieceCentreDiffers += (is.geometry().center() - expected).two_norm() > 0.1;
+            }
+        }
+    }
+    BOOST_CHECK_GT(acrossFault, 0);
+    BOOST_CHECK_GT(pieceCentreDiffers, 0);  // the shared pieces really are offset by the throw
+}
