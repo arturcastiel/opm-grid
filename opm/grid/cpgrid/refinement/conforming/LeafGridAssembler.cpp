@@ -218,9 +218,12 @@ void setDistributedLeafIds(CpGridData& leaf, const CpGridData& level0,
     const auto& pointIds0 = ids0.template getMapping<3>();
     const int numCorners0 = level0.size(3);
 
-    // The largest id in use: level zero's (over cells and points; every face id lies
-    // below every point id), and the leaf's cell ids.
+    // Bound for new face and point ids. Internal face ids may exceed the cell
+    // and point ids considered by getMaxGlobalId().
     int maxUsed = static_cast<int>(ids0.getMaxGlobalId());
+    if (!faceIds0.empty()) {
+        maxUsed = std::max(maxUsed, std::ranges::max(faceIds0));
+    }
     if (!cellIds.empty()) {
         maxUsed = std::max(maxUsed, std::ranges::max(cellIds));
     }

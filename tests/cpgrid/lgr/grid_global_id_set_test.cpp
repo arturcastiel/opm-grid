@@ -100,6 +100,61 @@ SCHEDULE
     return grid;
 }
 
+// Cells and vertices share an entity-ID space. CpGrid does not expose face
+// entities, but maintains internal face identifiers in a separate space, where
+// overlap with entity IDs is allowed. getMaxGlobalId() bounds cell and vertex
+// IDs only. Code allocating new internal face IDs must account for retained
+// face IDs separately, as setDistributedLeafIds() does.
+
+// This grid has more faces than vertices, so its largest internal face ID
+// exceeds every entity ID. Guard against including that face ID in the bound
+// used to allocate new cell and vertex IDs on a sequential grid.
+BOOST_AUTO_TEST_CASE(maximumIgnoresSequentialFaceIds)
+{
+    auto grid = createTestGrid();
+    const auto& level0 = *grid.currentData()[0];
+    const auto& ids = level0.globalIdSet();
+    if (level0.numFaces() == 0) {
+        BOOST_CHECK_EQUAL(ids.getMaxGlobalId(), 0);
+        return;
+    }
+    const auto maxFaceId = ids.idLevelZero(Dune::cpgrid::EntityRep<1>(level0.numFaces() - 1, true));
+    BOOST_CHECK_GT(maxFaceId, ids.getMaxCodimGlobalId<0>());
+    BOOST_CHECK_GT(maxFaceId, ids.getMaxCodimGlobalId<3>());
+    BOOST_CHECK_EQUAL(ids.getMaxGlobalId(), ids.getMaxCodimGlobalId<3>());
+}
+
+// Distributed grids use explicit ID mappings. A larger internal face ID must
+// remain accessible through its mapping without changing the entity-ID bound.
+BOOST_AUTO_TEST_CASE(maximumIgnoresMappedFaceIds)
+{
+    Dune::cpgrid::LevelGlobalIdSet ids;
+    std::vector<int> cells = {2, 7};
+    std::vector<int> faces = {19, 11};
+    std::vector<int> points = {13};
+    ids.swap(cells, faces, points);
+    BOOST_CHECK_EQUAL(ids.getMaxCodimGlobalId<1>(), 19);
+    BOOST_CHECK_EQUAL(ids.getMaxGlobalId(), 13);
+}
+
+// An empty MPI rank can have empty mappings. Looking for their maximum must
+// not dereference an end iterator; return zero, as the sequential path does,
+// so the rank can still participate in a communicator-wide maximum.
+BOOST_AUTO_TEST_CASE(maximumHandlesEmptyMappings)
+{
+    Dune::cpgrid::LevelGlobalIdSet ids;
+    BOOST_CHECK_EQUAL(ids.getMaxCodimGlobalId<0>(), 0);
+    BOOST_CHECK_EQUAL(ids.getMaxCodimGlobalId<1>(), 0);
+    BOOST_CHECK_EQUAL(ids.getMaxCodimGlobalId<3>(), 0);
+    BOOST_CHECK_EQUAL(ids.getMaxGlobalId(), 0);
+
+    std::vector<int> cells;
+    std::vector<int> faces = {19};
+    std::vector<int> points;
+    ids.swap(cells, faces, points);
+    // Internal face identifiers alone do not populate the cell/vertex ID space.
+    BOOST_CHECK_EQUAL(ids.getMaxGlobalId(), 0);
+}
 
 BOOST_AUTO_TEST_CASE(allLevelCellsHaveIdOnGridGlobalIdSet)
 {
